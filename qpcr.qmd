@@ -1,0 +1,212 @@
+---
+title: "Analysis of qPCR data using R"
+format:
+  html:
+    df-print: paged
+---
+
+## Resources
+
+-   <https://liz-is.github.io/qpcr-analysis-with-r>
+
+-   <https://jorikbot.com/post/an-r-function-to-removing-qpcr-outliers-within-technical-replicates>
+
+-   <https://github.com/ewallace/tidyqpcr>
+
+-   <https://github.com/daniel-gerhard/qpcrmix>
+
+-   <https://doi.org/10.3389/fgene.2022.1002704>
+
+-   <https://doi.org/10.1373/clinchem.2008.112797>
+
+## Import and munge the qPCR data
+
+We are going to use R to analyse some qPCR data. The `qpcr_data.csv` file contains qPCR data as exported from the software on the qPCR machine. Note that different machines/software versions will export data in different formats or with a different organisation, so this may look different to the qPCR data that you use.
+
+```{r}
+#| output: false
+library(tidyverse)
+library(magrittr)
+library(janitor)
+library(readxl)
+
+theme_set(theme_bw())
+```
+
+The `qpcr_data.csv` file contains metadata about the qPCR run, as well as the results of that run. The metadata is useful to have for reference, but in order to analyse the data in R, we just want to import the tabular data lower down in the file. The table of results starts on line 28 of the file.
+
+```{r}
+qpcr_data <- read_csv("qpcr_data.csv", skip = 27, show_col_types = FALSE) %>% clean_names()
+
+qpcr_data
+```
+
+This is a simple qPCR experiment to check whether RNAi knockdown of a target gene is effective. The samples include two different RNAi treatments and a control, as you can see in the `Sample.Name` column. However, information on what primers were used is missing from this file.
+
+In this case, we know that rows A-D were set up with primers for a housekeeping reference gene, and rows E-H were set up using primers for the target gene. We can create another data frame containing this information and combine it with the qPCR data.
+
+```{r}
+primer_key <- tibble(row = c("A", "B", "C", "D", "E", "F", "G", "H"),
+                     primers = c(rep("reference", 4), rep("target", 4)))
+
+primer_key
+```
+
+```{r}
+qpcr_data %<>% separate(well, into = c("row", "column"), sep = 1, convert = TRUE)
+
+qpcr_data
+```
+
+```{r}
+qpcr_data %<>% left_join(primer_key, by = "row")
+
+qpcr_data
+```
+
+Let's make a quick plot to check that everything looks as we expect it to.
+
+```{r}
+#| warning: false
+ggplot(qpcr_data, aes(x = column, y = row, fill = primers, label = sample_name)) +
+  geom_tile(colour = "black") +
+  geom_text(size = 2) +
+  scale_y_discrete(limits = c("H", "G", "F", "E", "D", "C", "B", "A")) +
+  scale_x_continuous(breaks = 1:12)
+```
+
+## Analyze the qPCR data
+
+Now that we've imported our data and confirmed the plate layout by plotting it, let's get to the actual analysis! This dataset has two different RNAi treatments and a control, with three biological replicates for each. Each biological replicate has three technical replicates, as well.
+
+### Calculate average Ct values
+
+We want to know whether the RNAi treatments are effective at knocking down our gene of interest. To do this, we will first calculate the average across technical replicates, then compare the Ct of our gene of interest to a housekeeping gene, then compare the treated samples with the control.
+
+First let's remove the "NTC" (no template control) and empty wells from the dataset.
+
+```{r}
+qpcr_data %<>% filter(sample_name != "NTC", sample_name != "")
+
+qpcr_data
+```
+
+The technical replicates have the same `sample_name`, so we can use the `group_by()` and `summarise()` functions from `dplyr` to calculate the mean Ct across the technical replicates for each sample.
+
+The Ct column is stored as a character vector, so let's first convert it to numeric format.
+
+```{r}
+class(qpcr_data$ct)
+```
+
+```{r}
+qpcr_data %<>%
+  mutate(ct = as.numeric(ct)) %>%
+  group_by(sample_name, primers) %>%
+  summarise(mean_ct = mean(ct))
+
+qpcr_data
+```
+
+The `sample_name` column contains information on both which RNAi was used and the biological replicate. Use the `separate()` function from the `tidyr` package to separate these into two new columns.
+
+```{r}
+qpcr_data %<>%
+  separate(sample_name, into = c("group", "replicate"), sep = "-")
+
+qpcr_data
+```
+
+Let's plot the mean Cts for each treatment for a quick comparison.
+
+```{r}
+ggplot(qpcr_data, aes(x = group, y = mean_ct, colour = primers)) +
+         geom_point()
+```
+
+### Analyze qPCR data using the "delta-delta-Ct method"
+
+One common way of analysing qPCR data is to use the "delta-delta-Ct" method. This involves calculating the difference between the Ct of the housekeeping reference gene and the target gene, then calculating the difference between the treated samples and the control.
+
+```{r}
+target_qpcr_data <- qpcr_data %>%
+  filter(primers == "target") %>%
+  rename(target_ct = mean_ct)
+
+reference_qpcr_data <- qpcr_data %>%
+  filter(primers == "reference") %>%
+  rename(reference_ct = mean_ct)
+
+combined_data <- left_join(target_qpcr_data, reference_qpcr_data, by = c("group", "replicate"))
+
+combined_data
+```
+
+Create a new column containing the delta Ct between the housekeeping gene and our gene of interest, and plot the delta Ct for each treatment and replicate.
+
+```{r}
+combined_data %<>% mutate(dct = reference_ct - target_ct)
+
+combined_data
+```
+
+```{r}
+ggplot(combined_data, aes(x = group, y = dct)) +
+  geom_point()
+```
+
+Calculate the mean delta Ct for each treatment.
+
+```{r}
+treatment_summary <- combined_data %>%
+  group_by(group) %>%
+  summarise(mean_dct = mean(dct))
+
+treatment_summary
+```
+
+Now we can calculate the delta delta Ct of each replicate compared to the mean of the control sample.
+
+```{r}
+mean_control <- filter(treatment_summary, group == "Control") %>% pull(mean_dct)
+
+combined_data <- combined_data %>% 
+  mutate(ddct = mean_control - dct)
+
+combined_data
+```
+
+```{r}
+ggplot(combined_data, aes(x = group, y = ddct)) +
+  geom_point()
+```
+
+If you want to calculate the relative DNA concentration, you can use the fact that the amount of cDNA theoretically doubles every cycle.
+
+```{r}
+combined_data %<>%
+  mutate(rel_conc = 2^-ddct)
+
+combined_data
+```
+
+```{r}
+combined_data %<>%
+  group_by(group) %>%
+  mutate(mean_rel_conc = mean(rel_conc))
+
+combined_data
+```
+
+```{r}
+ggplot(combined_data, aes(x = primers.x, y = mean_rel_conc, fill = group, group = group)) +
+  geom_col(position = "dodge") +
+  geom_point(aes(y = rel_conc), position = position_dodge(width = 0.9)) +
+  scale_y_continuous("Relative concentration", labels = scales::percent) +
+  scale_fill_manual("", values = c("Control" = "grey", "RNAi1" = "lightblue", "RNAi2" = "steelblue4")) +
+  scale_x_discrete("")
+```
+
+\
+\
+\
